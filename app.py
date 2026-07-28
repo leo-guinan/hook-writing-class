@@ -20,6 +20,8 @@ STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 FATHOM_SITE_ID = os.environ.get("FATHOM_SITE_ID", "")
 REFERRALS = {"abraham": "Abraham"}
+EXPERIMENT_KEY = "hook-v1"
+EXPERIMENT_HOOKS = {"control": "If you can hook attention, you can hook money.", "treatment": "Unlock the secret: capturing attention is the first step to unlocking profits."}
 VARIANTS = {
     "x": {
         "eyebrow": "THE $3 HOOK WRITING CLASS",
@@ -67,6 +69,41 @@ def append_record(record):
     DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
     with DATA_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def experiment_event_seen(session_id, event):
+    if not DATA_PATH.exists():
+        return False
+    for line in DATA_PATH.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("kind") == "experiment_event" and record.get("experiment") == EXPERIMENT_KEY and record.get("session_id") == session_id and record.get("event") == event:
+            return True
+    return False
+
+
+def record_experiment_event(session_id, variant, event):
+    if not session_id or variant not in EXPERIMENT_HOOKS or event not in {"impression", "primer_started", "primer_succeeded", "checkout_clicked", "shared", "paid"}:
+        return
+    if experiment_event_seen(session_id, event):
+        return
+    append_record({"id": secrets.token_urlsafe(8), "kind": "experiment_event", "experiment": EXPERIMENT_KEY, "session_id": session_id, "variant": variant, "event": event, "created_at": datetime.now(timezone.utc).isoformat()})
+
+
+def experiment_counts():
+    counts = {variant: {event: 0 for event in ("impression", "primer_started", "primer_succeeded", "checkout_clicked", "shared", "paid")} for variant in EXPERIMENT_HOOKS}
+    if not DATA_PATH.exists():
+        return counts
+    for line in DATA_PATH.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("kind") == "experiment_event" and record.get("experiment") == EXPERIMENT_KEY and record.get("variant") in counts and record.get("event") in counts[record["variant"]]:
+            counts[record["variant"]][record["event"]] += 1
+    return counts
 
 
 def lead_for(lead_id):
@@ -143,7 +180,20 @@ def index():
     if referral not in REFERRALS:
         referral = ""
     key = variant_for(source)
-    return render_template("index.html", variant=VARIANTS[key], variant_key=key, source=source, referral=referral, stripe_url=STRIPE_PAYMENT_URL, fathom_site_id=FATHOM_SITE_ID)
+    variant = VARIANTS[key]
+    experiment_variant = request.cookies.get("hook_ab_variant", "")
+    if key == "default" and experiment_variant not in EXPERIMENT_HOOKS:
+        experiment_variant = secrets.choice(tuple(EXPERIMENT_HOOKS))
+    session_id = request.cookies.get("hook_session", "") or secrets.token_urlsafe(12)
+    if key == "default":
+        record_experiment_event(session_id, experiment_variant, "impression")
+    headline = EXPERIMENT_HOOKS.get(experiment_variant, variant["headline"]) if key == "default" else variant["headline"]
+    response = render_template("index.html", variant={**variant, "headline": headline}, variant_key=key, source=source, referral=referral, stripe_url=STRIPE_PAYMENT_URL, fathom_site_id=FATHOM_SITE_ID, experiment_key=EXPERIMENT_KEY, experiment_variant=experiment_variant)
+    response = app.make_response(response)
+    response.set_cookie("hook_session", session_id, max_age=60 * 60 * 24 * 90, samesite="Lax")
+    if experiment_variant:
+        response.set_cookie("hook_ab_variant", experiment_variant, max_age=60 * 60 * 24 * 90, samesite="Lax")
+    return response
 
 
 @app.post("/api/course/lesson")
@@ -178,6 +228,20 @@ def course_lesson():
         return jsonify({"ok": True, "result": result})
     except (requests.RequestException, ValueError, KeyError, IndexError, json.JSONDecodeError):
         return jsonify({"error": "The lesson coach missed the beat. Try again."}), 502
+
+
+@app.post("/api/experiment/event")
+def experiment_event():
+    payload = request.get_json(silent=True) or {}
+    session_id = request.cookies.get("hook_session", "")
+    variant = request.cookies.get("hook_ab_variant", "")
+    record_experiment_event(session_id, variant, str(payload.get("event", "")))
+    return jsonify({"ok": True})
+
+
+@app.get("/scoreboard")
+def scoreboard():
+    return render_template("scoreboard.html", experiment=EXPERIMENT_KEY, hooks=EXPERIMENT_HOOKS, counts=experiment_counts())
 
 
 @app.get("/course")
@@ -234,7 +298,9 @@ def stripe_webhook():
         return jsonify({"ok": True, "ignored": True})
     lead_id = str(session.get("client_reference_id", ""))
     lead = lead_for(lead_id)
-    append_record({"id": secrets.token_urlsafe(8), "kind": "referral_conversion", "stripe_event_id": event.get("id", ""), "lead_id": lead_id, "referral": lead.get("referral", ""), "amount_total": session.get("amount_total"), "currency": session.get("currency"), "created_at": datetime.now(timezone.utc).isoformat()})
+    append_record({"id": secrets.token_urlsafe(8), "kind": "referral_conversion", "stripe_event_id": event.get("id", ""), "lead_id": lead_id, "referral": lead.get("referral", ""), "experiment": lead.get("experiment", ""), "experiment_variant": lead.get("experiment_variant", ""), "amount_total": session.get("amount_total"), "currency": session.get("currency"), "created_at": datetime.now(timezone.utc).isoformat()})
+    if lead.get("experiment") == EXPERIMENT_KEY:
+        record_experiment_event(lead_id, lead.get("experiment_variant", ""), "paid")
     return jsonify({"ok": True})
 
 
@@ -257,7 +323,8 @@ def prime():
     if not key:
         return jsonify({"error": "The primer is not configured yet."}), 503
     lead_id = secrets.token_urlsafe(8)
-    record = {"id": lead_id, "email": email, "url": url, "twitter": twitter, "referral": referral, "source": str(payload.get("source", "direct"))[:120], "variant": variant_for(str(payload.get("source", ""))), "created_at": datetime.now(timezone.utc).isoformat(), "kind": "primer"}
+    experiment_variant = str(payload.get("experiment_variant", "")) if str(payload.get("experiment_variant", "")) in EXPERIMENT_HOOKS else ""
+    record = {"id": lead_id, "email": email, "url": url, "twitter": twitter, "referral": referral, "experiment": EXPERIMENT_KEY if experiment_variant else "", "experiment_variant": experiment_variant, "source": str(payload.get("source", "direct"))[:120], "variant": variant_for(str(payload.get("source", ""))), "created_at": datetime.now(timezone.utc).isoformat(), "kind": "primer"}
     try:
         page = requests.get(url, headers={"User-Agent": "HookClassPrimer/1.0"}, timeout=10, stream=True)
         page.raise_for_status()
