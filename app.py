@@ -16,6 +16,7 @@ app = Flask(__name__)
 DATA_PATH = Path(os.environ.get("HOOK_DATA_PATH", Path(__file__).parent / "data" / "signups.jsonl"))
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 STRIPE_PAYMENT_URL = os.environ.get("STRIPE_PAYMENT_URL", "")
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 FATHOM_SITE_ID = os.environ.get("FATHOM_SITE_ID", "")
 REFERRALS = {"abraham": "Abraham"}
@@ -48,6 +49,7 @@ VARIANTS = {
 
 SYSTEM_PROMPT = """You are the coach for a $3 hook-writing class for indie hackers. Teach curiosity hooks, not hype. Be concise and specific. Return JSON with keys: hook, why_it_works, risk, next_exercise. The hook must be honest, avoid invented numbers, and make a concrete promise or tension. The risk should name what would falsify it."""
 PRIMER_PROMPT = """You are the top-of-funnel coach for a $3 hook-writing class. Analyze only the supplied public page text. Be useful, specific, and honest. Do not invent business facts. Return JSON with exactly these keys: what_it_is, likely_audience, hook_gap, first_hook. Keep each value under 280 characters. The first_hook should be a curiosity hook worth testing, not hype."""
+LESSON_PROMPT = """You are teaching lesson one of a hook-writing class. Analyze the supplied page and current first sentence. Return JSON with exactly these keys: current_read, diagnosis, replacement, falsifier, test. Be specific, honest, and concise. Do not claim conversion improvement without evidence. The falsifier must name a measurable outcome."""
 
 
 def variant_for(source: str):
@@ -78,6 +80,17 @@ def lead_for(lead_id):
         if record.get("id") == lead_id:
             return record
     return {}
+
+
+def paid_session(session_id):
+    if not STRIPE_SECRET_KEY or not session_id.startswith("cs_"):
+        return None
+    response = requests.get(f"https://api.stripe.com/v1/checkout/sessions/{session_id}", auth=(STRIPE_SECRET_KEY, ""), timeout=15)
+    response.raise_for_status()
+    session = response.json()
+    if session.get("payment_status") != "paid":
+        return None
+    return session
 
 
 def valid_stripe_signature(payload, header):
@@ -131,6 +144,58 @@ def index():
         referral = ""
     key = variant_for(source)
     return render_template("index.html", variant=VARIANTS[key], variant_key=key, source=source, referral=referral, stripe_url=STRIPE_PAYMENT_URL, fathom_site_id=FATHOM_SITE_ID)
+
+
+@app.post("/api/course/lesson")
+def course_lesson():
+    payload = request.get_json(silent=True) or {}
+    session_id = str(payload.get("session_id", ""))
+    current_hook = str(payload.get("current_hook", "")).strip()[:1000]
+    if len(current_hook) < 5:
+        return jsonify({"error": "Write the current first sentence before asking for a diagnosis."}), 400
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Paid course verification is not configured."}), 503
+    try:
+        session = paid_session(session_id)
+    except requests.RequestException:
+        return jsonify({"error": "Stripe verification is temporarily unavailable."}), 502
+    if not session:
+        return jsonify({"error": "Payment could not be verified."}), 402
+    lead = lead_for(str(session.get("client_reference_id", "")))
+    if not lead.get("url"):
+        return jsonify({"error": "No captured site URL is attached to this payment."}), 409
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        return jsonify({"error": "The lesson coach is not configured yet."}), 503
+    try:
+        page = requests.get(public_url(lead["url"]), headers={"User-Agent": "HookClassLesson/1.0"}, timeout=10)
+        page.raise_for_status()
+        prompt = f"URL: {lead['url']}\nCURRENT FIRST SENTENCE: {current_hook}\nPUBLIC PAGE TEXT:\n{page.text[:24000]}"
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "HTTP-Referer": os.environ.get("PUBLIC_URL", "https://hooks.metaspn.network"), "X-Title": "The $3 Hook Writing Class"}, json={"model": OPENROUTER_MODEL, "messages": [{"role": "system", "content": LESSON_PROMPT}, {"role": "user", "content": prompt}], "temperature": 0.4, "response_format": {"type": "json_object"}}, timeout=35)
+        response.raise_for_status()
+        result = json.loads(response.json()["choices"][0]["message"]["content"])
+        append_record({"id": secrets.token_urlsafe(8), "kind": "lesson_one", "lead_id": str(session.get("client_reference_id", "")), "session_id": session_id, "created_at": datetime.now(timezone.utc).isoformat(), "status": "completed"})
+        return jsonify({"ok": True, "result": result})
+    except (requests.RequestException, ValueError, KeyError, IndexError, json.JSONDecodeError):
+        return jsonify({"error": "The lesson coach missed the beat. Try again."}), 502
+
+
+@app.get("/course")
+def course():
+    session_id = request.args.get("session_id", "")
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Paid course verification is not configured."}), 503
+    try:
+        session = paid_session(session_id)
+    except requests.RequestException:
+        return jsonify({"error": "Stripe verification is temporarily unavailable."}), 502
+    if not session:
+        return jsonify({"error": "Payment could not be verified."}), 402
+    lead_id = str(session.get("client_reference_id", ""))
+    lead = lead_for(lead_id)
+    if not lead.get("url"):
+        return jsonify({"error": "The paid session has no captured site URL."}), 409
+    return render_template("course.html", session_id=session_id, lead_id=lead_id, site_url=lead["url"], fathom_site_id=FATHOM_SITE_ID)
 
 
 @app.get("/health")

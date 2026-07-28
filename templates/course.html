@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 1 — The $3 Hook Writing Class</title>
+{% if fathom_site_id %}<script src="https://cdn.usefathom.com/script.js" data-site="{{ fathom_site_id }}" defer></script>{% endif %}
+<style>
+:root{--bg:#0b0d0c;--panel:#131715;--line:#2a332e;--ink:#f1f4ed;--muted:#9ba89f;--green:#b9ff6e;--orange:#ff9f43}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#18251a 0,transparent 36%),var(--bg);color:var(--ink);font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}main{max-width:860px;margin:auto;padding:28px 22px 90px}.mark,.eyebrow{color:var(--green);font-size:12px;letter-spacing:.1em;text-transform:uppercase}.eyebrow{color:var(--orange);margin-top:80px}h1,h2{font-family:Georgia,serif;font-weight:500;line-height:1.05}h1{font-size:clamp(42px,8vw,76px);letter-spacing:-.05em;margin:15px 0 22px}h2{font-size:34px;margin:0 0 14px}p{color:var(--muted);max-width:680px}.receipt{border:1px solid var(--green);padding:18px;margin:30px 0;color:var(--green);overflow-wrap:anywhere}.box{background:var(--panel);border:1px solid var(--line);padding:22px;margin-top:28px}.box label{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;margin-bottom:8px}.box textarea{width:100%;min-height:110px;background:#0c100d;border:1px solid var(--line);color:var(--ink);padding:13px;font:16px/1.5 ui-monospace}.button{border:1px solid var(--green);background:var(--green);color:#10140d;border-radius:4px;padding:13px 17px;font:600 14px ui-monospace;cursor:pointer;margin-top:14px}.result{white-space:pre-wrap;color:var(--ink);margin-top:22px}.error{color:#ff806f}.small{font-size:12px}
+</style>
+</head>
+<body><main>
+<div class="mark">HOOKS / PAID / 001</div>
+<div class="eyebrow">LESSON ONE</div>
+<h1>Your site is the specimen.</h1>
+<p>Payment is confirmed. We start with the page you brought, not a hypothetical startup in a deck.</p>
+<div class="receipt">PAYMENT VERIFIED<br><span class="small">Captured site: {{ site_url }}</span></div>
+<section><h2>Find the sentence doing the selling.</h2><p>Copy the first sentence a stranger sees on your page. If there is no sentence, write the sentence you think the page is currently trying to say. No polishing. We need the baseline before we touch it.</p>
+<div class="box"><label>Current first sentence</label><textarea id="currentHook" placeholder="Paste the first sentence from your page..."></textarea><button id="runLesson">Diagnose my hook →</button><p id="message" class="small"></p><div id="result" class="result"></div></div></section>
+<footer class="small">The test is not “did the sentence sound clever?” The test is whether more qualified strangers continue.</footer>
+</main>
+<script>
+const sessionId={{ session_id|tojson }};const $=id=>document.getElementById(id);const track=name=>{if(window.fathom)window.fathom.trackEvent(name);};
+$('runLesson').onclick=async()=>{const button=$('runLesson'),message=$('message');button.disabled=true;message.textContent='Reading the specimen...';track('Lesson One Started');try{const r=await fetch('/api/course/lesson',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,current_hook:$('currentHook').value})});const d=await r.json();if(!r.ok)throw Error(d.error);const x=d.result;$('result').textContent=`CURRENT READ\n${x.current_read}\n\nDIAGNOSIS\n${x.diagnosis}\n\nREPLACEMENT TO TEST\n${x.replacement}\n\nFALSIFIER\n${x.falsifier}\n\nTEST\n${x.test}`;message.textContent='Lesson one complete. Now run the test.';track('Lesson One Succeeded');}catch(e){message.textContent=e.message;message.className='error';track('Lesson One Failed');}finally{button.disabled=false;}};
+</script>
+</body></html>
