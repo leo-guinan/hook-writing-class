@@ -1,7 +1,10 @@
+import hashlib
+import hmac
 import json
 import os
 import secrets
 import socket
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
@@ -13,6 +16,7 @@ app = Flask(__name__)
 DATA_PATH = Path(os.environ.get("HOOK_DATA_PATH", Path(__file__).parent / "data" / "signups.jsonl"))
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 STRIPE_PAYMENT_URL = os.environ.get("STRIPE_PAYMENT_URL", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 FATHOM_SITE_ID = os.environ.get("FATHOM_SITE_ID", "")
 REFERRALS = {"abraham": "Abraham"}
 VARIANTS = {
@@ -63,6 +67,34 @@ def append_record(record):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def lead_for(lead_id):
+    if not DATA_PATH.exists():
+        return {}
+    for line in DATA_PATH.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("id") == lead_id:
+            return record
+    return {}
+
+
+def valid_stripe_signature(payload, header):
+    if not STRIPE_WEBHOOK_SECRET:
+        return False
+    values = dict(part.split("=", 1) for part in header.split(",") if "=" in part)
+    try:
+        timestamp = int(values.get("t", "0"))
+    except ValueError:
+        return False
+    signature = values.get("v1", "")
+    if not signature or abs(time.time() - timestamp) > 300:
+        return False
+    expected = hmac.new(STRIPE_WEBHOOK_SECRET.encode(), f"{timestamp}.{payload.decode()}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
 def public_url(value):
     parsed = urlparse(value.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
@@ -103,7 +135,7 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "hook-writing-class", "llm_configured": bool(os.environ.get("OPENROUTER_API_KEY"))})
+    return jsonify({"ok": True, "service": "hook-writing-class", "llm_configured": bool(os.environ.get("OPENROUTER_API_KEY")), "fathom_configured": bool(FATHOM_SITE_ID), "stripe_webhook_configured": bool(STRIPE_WEBHOOK_SECRET)})
 
 
 @app.post("/api/join")
@@ -122,6 +154,23 @@ def join():
     }
     append_record(record)
     return jsonify({"ok": True, "message": "You’re in. Bring one thing you made."})
+
+
+@app.post("/stripe/webhook")
+def stripe_webhook():
+    payload = request.get_data()
+    if not valid_stripe_signature(payload, request.headers.get("Stripe-Signature", "")):
+        return jsonify({"error": "Invalid webhook signature."}), 400
+    event = request.get_json(silent=True) or {}
+    if event.get("type") != "checkout.session.completed":
+        return jsonify({"ok": True, "ignored": True})
+    session = event.get("data", {}).get("object", {})
+    if session.get("payment_status") != "paid":
+        return jsonify({"ok": True, "ignored": True})
+    lead_id = str(session.get("client_reference_id", ""))
+    lead = lead_for(lead_id)
+    append_record({"id": secrets.token_urlsafe(8), "kind": "referral_conversion", "stripe_event_id": event.get("id", ""), "lead_id": lead_id, "referral": lead.get("referral", ""), "amount_total": session.get("amount_total"), "currency": session.get("currency"), "created_at": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"ok": True})
 
 
 @app.post("/api/prime")
