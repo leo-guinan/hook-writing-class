@@ -19,3 +19,11 @@ Referral variants:
 - `?src=essay` — essay framing
 - `?src=builder` — shipper framing
 - anything else — direct framing
+
+Referral links:
+- `https://hooks.metaspn.network/r/abraham` — Abraham
+- Referral clicks are recorded before redirect; the referral is carried into the captured lead and Stripe UTM parameters.
+
+Analytics:
+- Fathom site: `Hook Writing Class`
+- Events: `Exercise Started`, `Exercise Succeeded`, `Exercise Failed`, `Primer Started`, `Primer Succeeded`, `Primer Failed`, `Checkout Clicked`

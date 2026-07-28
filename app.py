@@ -7,12 +7,14 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request
 
 app = Flask(__name__)
 DATA_PATH = Path(os.environ.get("HOOK_DATA_PATH", Path(__file__).parent / "data" / "signups.jsonl"))
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 STRIPE_PAYMENT_URL = os.environ.get("STRIPE_PAYMENT_URL", "")
+FATHOM_SITE_ID = os.environ.get("FATHOM_SITE_ID", "")
+REFERRALS = {"abraham": "Abraham"}
 VARIANTS = {
     "x": {
         "eyebrow": "THE $3 HOOK WRITING CLASS",
@@ -72,16 +74,31 @@ def public_url(value):
     return parsed.geturl()
 
 
-def stripe_checkout_url(email, lead_id):
-    params = urlencode({"prefilled_email": email, "client_reference_id": lead_id})
-    return f"{STRIPE_PAYMENT_URL}&{params}" if "?" in STRIPE_PAYMENT_URL else f"{STRIPE_PAYMENT_URL}?{params}"
+def stripe_checkout_url(email, lead_id, referral=""):
+    params = {"prefilled_email": email, "client_reference_id": lead_id}
+    if referral:
+        params.update({"utm_source": "referral", "utm_medium": "hook-class", "utm_campaign": "abraham", "utm_content": referral})
+    query = urlencode(params)
+    return f"{STRIPE_PAYMENT_URL}&{query}" if "?" in STRIPE_PAYMENT_URL else f"{STRIPE_PAYMENT_URL}?{query}"
+
+
+@app.get("/r/<referral>")
+def referral_redirect(referral):
+    referral = referral.lower().strip()
+    if referral not in REFERRALS:
+        return jsonify({"error": "Unknown referral link."}), 404
+    append_record({"id": secrets.token_urlsafe(8), "kind": "referral_click", "referral": referral, "label": REFERRALS[referral], "referrer": request.headers.get("Referer", "")[:200], "created_at": datetime.now(timezone.utc).isoformat()})
+    return redirect(f"/?ref={referral}&src={referral}")
 
 
 @app.get("/")
 def index():
     source = request.args.get("src", request.args.get("utm_source", ""))
+    referral = request.args.get("ref", "").lower().strip()
+    if referral not in REFERRALS:
+        referral = ""
     key = variant_for(source)
-    return render_template("index.html", variant=VARIANTS[key], variant_key=key, source=source, stripe_url=STRIPE_PAYMENT_URL)
+    return render_template("index.html", variant=VARIANTS[key], variant_key=key, source=source, referral=referral, stripe_url=STRIPE_PAYMENT_URL, fathom_site_id=FATHOM_SITE_ID)
 
 
 @app.get("/health")
@@ -113,6 +130,9 @@ def prime():
     email = str(payload.get("email", "")).strip().lower()
     url = str(payload.get("url", "")).strip()
     twitter = str(payload.get("twitter", "")).strip()[:120]
+    referral = str(payload.get("referral", "")).lower().strip()
+    if referral not in REFERRALS:
+        referral = ""
     if "@" not in email or len(email) > 254:
         return jsonify({"error": "A real email address is required."}), 400
     try:
@@ -123,7 +143,7 @@ def prime():
     if not key:
         return jsonify({"error": "The primer is not configured yet."}), 503
     lead_id = secrets.token_urlsafe(8)
-    record = {"id": lead_id, "email": email, "url": url, "twitter": twitter, "source": str(payload.get("source", "direct"))[:120], "variant": variant_for(str(payload.get("source", ""))), "created_at": datetime.now(timezone.utc).isoformat(), "kind": "primer"}
+    record = {"id": lead_id, "email": email, "url": url, "twitter": twitter, "referral": referral, "source": str(payload.get("source", "direct"))[:120], "variant": variant_for(str(payload.get("source", ""))), "created_at": datetime.now(timezone.utc).isoformat(), "kind": "primer"}
     try:
         page = requests.get(url, headers={"User-Agent": "HookClassPrimer/1.0"}, timeout=10, stream=True)
         page.raise_for_status()
@@ -141,11 +161,11 @@ def prime():
         primer = json.loads(response.json()["choices"][0]["message"]["content"])
         record["status"] = "primed"
         append_record(record)
-        return jsonify({"ok": True, "lead_id": lead_id, "primer": primer, "checkout_url": stripe_checkout_url(email, lead_id)})
+        return jsonify({"ok": True, "lead_id": lead_id, "primer": primer, "checkout_url": stripe_checkout_url(email, lead_id, referral)})
     except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError):
         record["status"] = "primer_failed"
         append_record(record)
-        return jsonify({"ok": True, "lead_id": lead_id, "primer": {"what_it_is": "I could not read the page just now.", "likely_audience": "We’ll identify this in the class.", "hook_gap": "The page needs a sharper first sentence.", "first_hook": "Bring the page to class and we’ll find the tension worth testing."}, "checkout_url": stripe_checkout_url(email, lead_id), "message": "I saved your place. The primer missed the beat, but checkout is ready."})
+        return jsonify({"ok": True, "lead_id": lead_id, "primer": {"what_it_is": "I could not read the page just now.", "likely_audience": "We’ll identify this in the class.", "hook_gap": "The page needs a sharper first sentence.", "first_hook": "Bring the page to class and we’ll find the tension worth testing."}, "checkout_url": stripe_checkout_url(email, lead_id, referral), "message": "I saved your place. The primer missed the beat, but checkout is ready."})
 
 
 @app.post("/api/exercise")
