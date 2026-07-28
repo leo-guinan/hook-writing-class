@@ -1,8 +1,10 @@
 import json
 import os
 import secrets
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode, urlparse
 
 import requests
 from flask import Flask, jsonify, render_template, request
@@ -39,6 +41,7 @@ VARIANTS = {
 }
 
 SYSTEM_PROMPT = """You are the coach for a $3 hook-writing class for indie hackers. Teach curiosity hooks, not hype. Be concise and specific. Return JSON with keys: hook, why_it_works, risk, next_exercise. The hook must be honest, avoid invented numbers, and make a concrete promise or tension. The risk should name what would falsify it."""
+PRIMER_PROMPT = """You are the top-of-funnel coach for a $3 hook-writing class. Analyze only the supplied public page text. Be useful, specific, and honest. Do not invent business facts. Return JSON with exactly these keys: what_it_is, likely_audience, hook_gap, first_hook. Keep each value under 280 characters. The first_hook should be a curiosity hook worth testing, not hype."""
 
 
 def variant_for(source: str):
@@ -56,6 +59,22 @@ def append_record(record):
     DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
     with DATA_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def public_url(value):
+    parsed = urlparse(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Use a public http:// or https:// URL.")
+    addresses = socket.getaddrinfo(parsed.hostname, None)
+    import ipaddress
+    if not addresses or any(ipaddress.ip_address(address[4][0]).is_private or ipaddress.ip_address(address[4][0]).is_loopback or ipaddress.ip_address(address[4][0]).is_link_local for address in addresses):
+        raise ValueError("That URL points to a private network.")
+    return parsed.geturl()
+
+
+def stripe_checkout_url(email, lead_id):
+    params = urlencode({"prefilled_email": email, "client_reference_id": lead_id})
+    return f"{STRIPE_PAYMENT_URL}&{params}" if "?" in STRIPE_PAYMENT_URL else f"{STRIPE_PAYMENT_URL}?{params}"
 
 
 @app.get("/")
@@ -86,6 +105,47 @@ def join():
     }
     append_record(record)
     return jsonify({"ok": True, "message": "You’re in. Bring one thing you made."})
+
+
+@app.post("/api/prime")
+def prime():
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email", "")).strip().lower()
+    url = str(payload.get("url", "")).strip()
+    twitter = str(payload.get("twitter", "")).strip()[:120]
+    if "@" not in email or len(email) > 254:
+        return jsonify({"error": "A real email address is required."}), 400
+    try:
+        url = public_url(url)
+    except (ValueError, socket.gaierror, socket.timeout):
+        return jsonify({"error": "Use a public website or product URL."}), 400
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        return jsonify({"error": "The primer is not configured yet."}), 503
+    lead_id = secrets.token_urlsafe(8)
+    record = {"id": lead_id, "email": email, "url": url, "twitter": twitter, "source": str(payload.get("source", "direct"))[:120], "variant": variant_for(str(payload.get("source", ""))), "created_at": datetime.now(timezone.utc).isoformat(), "kind": "primer"}
+    try:
+        page = requests.get(url, headers={"User-Agent": "HookClassPrimer/1.0"}, timeout=10, stream=True)
+        page.raise_for_status()
+        chunks = []
+        total = 0
+        for chunk in page.iter_content(16384):
+            total += len(chunk)
+            chunks.append(chunk)
+            if total >= 120000:
+                break
+        content = b"".join(chunks)[:120000].decode("utf-8", errors="ignore")
+        prompt = f"URL: {url}\nPUBLIC PAGE TEXT:\n{content[:24000]}"
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "HTTP-Referer": os.environ.get("PUBLIC_URL", "https://hooks.metaspn.network"), "X-Title": "The $3 Hook Writing Class"}, json={"model": OPENROUTER_MODEL, "messages": [{"role": "system", "content": PRIMER_PROMPT}, {"role": "user", "content": prompt}], "temperature": 0.4, "response_format": {"type": "json_object"}}, timeout=35)
+        response.raise_for_status()
+        primer = json.loads(response.json()["choices"][0]["message"]["content"])
+        record["status"] = "primed"
+        append_record(record)
+        return jsonify({"ok": True, "lead_id": lead_id, "primer": primer, "checkout_url": stripe_checkout_url(email, lead_id)})
+    except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError):
+        record["status"] = "primer_failed"
+        append_record(record)
+        return jsonify({"error": "I saved your place, but the primer missed the beat. Continue to checkout and we’ll handle it in class."}), 502
 
 
 @app.post("/api/exercise")
