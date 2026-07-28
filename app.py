@@ -10,6 +10,7 @@ from flask import Flask, jsonify, render_template, request
 app = Flask(__name__)
 DATA_PATH = Path(os.environ.get("HOOK_DATA_PATH", Path(__file__).parent / "data" / "signups.jsonl"))
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+STRIPE_PAYMENT_URL = os.environ.get("STRIPE_PAYMENT_URL", "")
 VARIANTS = {
     "x": {
         "eyebrow": "THE $3 HOOK WRITING CLASS",
@@ -61,7 +62,7 @@ def append_record(record):
 def index():
     source = request.args.get("src", request.args.get("utm_source", ""))
     key = variant_for(source)
-    return render_template("index.html", variant=VARIANTS[key], variant_key=key, source=source)
+    return render_template("index.html", variant=VARIANTS[key], variant_key=key, source=source, stripe_url=STRIPE_PAYMENT_URL)
 
 
 @app.get("/health")
