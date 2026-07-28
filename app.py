@@ -145,7 +145,7 @@ def prime():
     except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError):
         record["status"] = "primer_failed"
         append_record(record)
-        return jsonify({"error": "I saved your place, but the primer missed the beat. Continue to checkout and we’ll handle it in class."}), 502
+        return jsonify({"ok": True, "lead_id": lead_id, "primer": {"what_it_is": "I could not read the page just now.", "likely_audience": "We’ll identify this in the class.", "hook_gap": "The page needs a sharper first sentence.", "first_hook": "Bring the page to class and we’ll find the tension worth testing."}, "checkout_url": stripe_checkout_url(email, lead_id), "message": "I saved your place. The primer missed the beat, but checkout is ready."})
 
 
 @app.post("/api/exercise")
